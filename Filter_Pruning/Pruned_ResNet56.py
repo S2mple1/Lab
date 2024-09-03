@@ -1,11 +1,15 @@
+import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchprofile
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import numpy as np
 import torch.nn.functional as F
+
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -30,6 +34,7 @@ class BasicBlock(nn.Module):
         out += self.shortcut(x)
         out = F.relu(out)
         return out
+
 
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
@@ -61,8 +66,10 @@ class ResNet(nn.Module):
         out = self.linear(out)
         return out
 
+
 def ResNet56():
     return ResNet(BasicBlock, [9, 9, 9])
+
 
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
@@ -81,7 +88,7 @@ test_set = torchvision.datasets.CIFAR10("./data/test", train=False, transform=tr
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH_SIZE = 128
-EPOCHS = 20
+EPOCHS = 135
 LR = 0.01
 
 train_dataLoader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
@@ -89,8 +96,9 @@ test_dataLoader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
 
 net = ResNet56().to(DEVICE)
 
-print("Original ResNet56:")
-print(net)
+# print("Original ResNet56:")
+# print(net)
+
 
 def prune_conv_layer(layer, amount):
     # 提取第一个子层（卷积层）
@@ -112,7 +120,7 @@ def prune_conv_layer(layer, amount):
     ).to(DEVICE)
 
     new_conv.weight.data = torch.from_numpy(
-        np.delete(weight, prune_indices, axis=0) # weight的形状是[输入通道数, 输出通道数, 卷积核高, 卷积核宽]
+        np.delete(weight, prune_indices, axis=0)  # weight的形状是[输入通道数, 输出通道数, 卷积核高, 卷积核宽]
     ).to(DEVICE)
 
     # 调整第一个BN层的参数
@@ -150,19 +158,22 @@ def prune_resnet56(net, skip_layers, prune_ratios):
     for i, layer in enumerate([net.layer1, net.layer2, net.layer3]):
         for j in range(len(layer)):
             if layer_idx not in skip_layers:
-                print(f"Pruning layer {layer_idx} with ratio {prune_ratios[i]}")
+                # print(f"Pruning layer {layer_idx} with ratio {prune_ratios[i]}")
                 layer[j].conv1, layer[j].bn1, layer[j].conv2 = prune_conv_layer(layer[j], prune_ratios[i])
             layer_idx += 2
 
 
-skip_layers = [16, 18, 20, 34, 38, 54]
-prune_ratios = [0.6, 0.3, 0.1]  # p1=60%, p2=30%, p3=10%
+def measure_inference_time(model, dataLoader, device):
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        for data in dataLoader:
+            inputs, _ = data
+            inputs = inputs.to(device)
+            _ = model(inputs)
+    end_time = time.time()
+    return end_time - start_time
 
-
-prune_resnet56(net, skip_layers, prune_ratios)
-print("-" * 50)
-print("Pruned ResNet56:")
-print(net)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
@@ -190,6 +201,7 @@ def train(epoch, model, train_dataLoader, criterion, optimizer, device):
         print("Epoch: {} - iter: {} | Loss: {:.3f} | Acc: {:.3f}%".format(
             epoch, batch_idx, train_loss / (batch_idx + 1), correct * 100. / total))
 
+
 def test(epoch, model, test_dataLoader, device):
     total = 0
     correct = 0
@@ -208,7 +220,53 @@ def test(epoch, model, test_dataLoader, device):
 
     print("Epoch: {}, Accuracy: {:.2f}%".format(epoch, correct * 100. / total))
 
+
+def train_original_model():
+    print("Training original model...")
+    for epoch in range(EPOCHS):
+        train(epoch, net, train_dataLoader, criterion, optimizer, DEVICE)
+        test(epoch, net, test_dataLoader, DEVICE)
+
+
 # 微调20个epoch
-for epoch in range(EPOCHS):
-    train(epoch, net, train_dataLoader, criterion, optimizer, DEVICE)
-    test(epoch, net, test_dataLoader, DEVICE)
+def fine_tune_pruned_model():
+    print("Fine-tuning pruned model...")
+    for epoch in range(20):
+        train(epoch, net, train_dataLoader, criterion, optimizer, DEVICE)
+        test(epoch, net, test_dataLoader, DEVICE)
+    torch.save(net.state_dict(), "fine_tuned_pruned_model.pth")
+
+
+skip_layers = [16, 18, 20, 34, 38, 54]
+prune_ratios = [0.6, 0.3, 0.1]  # p1=60%, p2=30%, p3=10%
+
+# 训练原始模型
+# print("-" * 50)
+# train_original_model()
+
+# 测量剪枝前的FLOPS
+print("-" * 50)
+test_tensor = torch.randn(1, 3, 32, 32).to(DEVICE)
+origin_flops = torchprofile.profile_macs(net, test_tensor)
+print(f"Origin Total FLOPs: {origin_flops / 1e6} MFLOPs")
+
+prune_resnet56(net, skip_layers, prune_ratios)
+
+# print("-" * 50)
+# print("Pruned ResNet56:")
+# print(net)
+
+
+# 微调剪枝后的模型
+# print("-" * 50)
+# fine_tune_pruned_model()
+
+# 测量剪枝后的FLOPS
+print("-" * 50)
+pruned_flops = torchprofile.profile_macs(net, test_tensor)
+print(f"Pruned Total FLOPs: {pruned_flops / 1e6} MFLOPs")
+
+# 计算剪枝后的压缩率
+print("-" * 50)
+print(f"Reduced FLOPS: {(1 - pruned_flops / origin_flops) * 100:.2f}%")
+
